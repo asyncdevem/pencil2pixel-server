@@ -14,7 +14,8 @@ import cv2
 from datetime import datetime, timedelta
 from functools import wraps
 import jwt
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
 import uuid
 
@@ -37,7 +38,7 @@ print("✓ Applied GFPGAN compatibility patch for torchvision")
 app = Flask(__name__)
 CORS(app)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['DATABASE'] = os.environ.get('DATABASE_PATH', 'pencil2pixel.db')
+app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb%ssslmode=require')
 
 # Quality enhancement settings
 QUALITY_PRESETS = {
@@ -248,12 +249,12 @@ def create_mask_from_sketch(img, threshold=250):
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect(app.config['DATABASE'])
+    conn = psycopg2.connect(app.config['DATABASE_URL'])
     c = conn.cursor()
     
     # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id TEXT UNIQUE NOT NULL,
         username TEXT UNIQUE NOT NULL,
         email TEXT UNIQUE NOT NULL,
@@ -264,11 +265,11 @@ def init_db():
     
     # Image history table
     c.execute('''CREATE TABLE IF NOT EXISTS image_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         image_id TEXT UNIQUE NOT NULL,
         user_id TEXT NOT NULL,
         original_filename TEXT,
-        generated_image BLOB NOT NULL,
+        generated_image BYTEA NOT NULL,
         attributes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
@@ -278,8 +279,7 @@ def init_db():
     conn.close()
 
 def get_db():
-    conn = sqlite3.connect(app.config['DATABASE'])
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(app.config['DATABASE_URL'], cursor_factory=RealDictCursor)
     return conn
 
 # Initialize database on startup
@@ -331,7 +331,7 @@ def signup():
         c = conn.cursor()
         
         # Check if user already exists
-        c.execute('SELECT * FROM users WHERE username = ? OR email = ?', (username, email))
+        c.execute('SELECT * FROM users WHERE username = %s OR email = %s', (username, email))
         if c.fetchone():
             conn.close()
             return jsonify({'error': 'Username or email already exists'}), 409
@@ -340,7 +340,7 @@ def signup():
         user_id = str(uuid.uuid4())
         password_hash = generate_password_hash(password)
         
-        c.execute('INSERT INTO users (user_id, username, email, password_hash) VALUES (?, ?, ?, ?)',
+        c.execute('INSERT INTO users (user_id, username, email, password_hash) VALUES (%s, %s, %s, %s)',
                   (user_id, username, email, password_hash))
         conn.commit()
         conn.close()
@@ -378,7 +378,7 @@ def login():
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('SELECT * FROM users WHERE email = ?', (email,))
+        c.execute('SELECT * FROM users WHERE email = %s', (email,))
         user = c.fetchone()
         conn.close()
         
@@ -411,11 +411,11 @@ def get_profile(current_user_id):
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('SELECT user_id, username, email, created_at FROM users WHERE user_id = ?', (current_user_id,))
+        c.execute('SELECT user_id, username, email, created_at FROM users WHERE user_id = %s', (current_user_id,))
         user = c.fetchone()
         
         # Get image count
-        c.execute('SELECT COUNT(*) as count FROM image_history WHERE user_id = ?', (current_user_id,))
+        c.execute('SELECT COUNT(*) as count FROM image_history WHERE user_id = %s', (current_user_id,))
         image_count = c.fetchone()['count']
         
         conn.close()
@@ -453,27 +453,27 @@ def update_profile(current_user_id):
         
         if 'username' in data:
             # Check if username already exists
-            c.execute('SELECT * FROM users WHERE username = ? AND user_id != ?', (data['username'], current_user_id))
+            c.execute('SELECT * FROM users WHERE username = %s AND user_id != %s', (data['username'], current_user_id))
             if c.fetchone():
                 conn.close()
                 return jsonify({'error': 'Username already exists'}), 409
-            updates.append('username = ?')
+            updates.append('username = %s')
             params.append(data['username'])
         
         if 'email' in data:
             # Check if email already exists
-            c.execute('SELECT * FROM users WHERE email = ? AND user_id != ?', (data['email'], current_user_id))
+            c.execute('SELECT * FROM users WHERE email = %s AND user_id != %s', (data['email'], current_user_id))
             if c.fetchone():
                 conn.close()
                 return jsonify({'error': 'Email already exists'}), 409
-            updates.append('email = ?')
+            updates.append('email = %s')
             params.append(data['email'])
         
         if 'password' in data:
             if len(data['password']) < 6:
                 conn.close()
                 return jsonify({'error': 'Password must be at least 6 characters'}), 400
-            updates.append('password_hash = ?')
+            updates.append('password_hash = %s')
             params.append(generate_password_hash(data['password']))
         
         if not updates:
@@ -483,11 +483,11 @@ def update_profile(current_user_id):
         updates.append('updated_at = CURRENT_TIMESTAMP')
         params.append(current_user_id)
         
-        query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
+        query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
         c.execute(query, params)
         conn.commit()
         
-        c.execute('SELECT user_id, username, email, updated_at FROM users WHERE user_id = ?', (current_user_id,))
+        c.execute('SELECT user_id, username, email, updated_at FROM users WHERE user_id = %s', (current_user_id,))
         user = c.fetchone()
         conn.close()
         
@@ -518,12 +518,12 @@ def get_history(current_user_id):
         
         c.execute('''SELECT image_id, original_filename, attributes, created_at 
                      FROM image_history 
-                     WHERE user_id = ? 
+                     WHERE user_id = %s 
                      ORDER BY created_at DESC 
-                     LIMIT ? OFFSET ?''', (current_user_id, limit, offset))
+                     LIMIT %s OFFSET %s''', (current_user_id, limit, offset))
         images = c.fetchall()
         
-        c.execute('SELECT COUNT(*) as total FROM image_history WHERE user_id = ?', (current_user_id,))
+        c.execute('SELECT COUNT(*) as total FROM image_history WHERE user_id = %s', (current_user_id,))
         total = c.fetchone()['total']
         
         conn.close()
@@ -553,7 +553,7 @@ def get_history_image(current_user_id, image_id):
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('SELECT * FROM image_history WHERE image_id = ? AND user_id = ?', (image_id, current_user_id))
+        c.execute('SELECT * FROM image_history WHERE image_id = %s AND user_id = %s', (image_id, current_user_id))
         image = c.fetchone()
         conn.close()
         
@@ -577,7 +577,7 @@ def delete_history_image(current_user_id, image_id):
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('DELETE FROM image_history WHERE image_id = ? AND user_id = ?', (image_id, current_user_id))
+        c.execute('DELETE FROM image_history WHERE image_id = %s AND user_id = %s', (image_id, current_user_id))
         
         if c.rowcount == 0:
             conn.close()
@@ -598,7 +598,7 @@ def clear_history(current_user_id):
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('DELETE FROM image_history WHERE user_id = ?', (current_user_id,))
+        c.execute('DELETE FROM image_history WHERE user_id = %s', (current_user_id,))
         deleted_count = c.rowcount
         
         conn.commit()
@@ -725,7 +725,7 @@ def generate(current_user_id):
             conn = get_db()
             c = conn.cursor()
             c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
-                         VALUES (?, ?, ?, ?, ?)''',
+                         VALUES (%s, %s, %s, %s, %s)''',
                       (image_id, current_user_id, file.filename, img_bytes, attr_str))
             conn.commit()
             conn.close()
@@ -838,7 +838,7 @@ def generate_batch(current_user_id):
             if save_to_history:
                 image_id = str(uuid.uuid4())
                 c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
-                             VALUES (?, ?, ?, ?, ?)''',
+                             VALUES (%s, %s, %s, %s, %s)''',
                           (image_id, current_user_id, file.filename, img_bytes, attr_str))
                 result['image_id'] = image_id
                 result['saved'] = True
@@ -885,7 +885,7 @@ def save_to_history(current_user_id):
         conn = get_db()
         c = conn.cursor()
         c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
-                     VALUES (?, ?, ?, ?, ?)''',
+                     VALUES (%s, %s, %s, %s, %s)''',
                   (image_id, current_user_id, original_filename, image_bytes, attributes))
         conn.commit()
         conn.close()

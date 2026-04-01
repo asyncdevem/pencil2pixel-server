@@ -9,3 +9,4 @@ PyJWT
 Werkzeug
 gunicorn
 gfpgan
+psycopg2-binary

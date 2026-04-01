@@ -1,5 +1,5 @@
 runtime: python
-startCommand: gunicorn -w 1 -b :8080 app:app --timeout 120 --preload
+startCommand: gunicorn -w 1 -b :8080 app:app --timeout 120 --worker-tmp-dir /tmp
 buildCommand: |
   apt-get update
   apt-get install -y libxcb1
