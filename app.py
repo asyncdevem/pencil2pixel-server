@@ -280,34 +280,46 @@ def create_mask_from_sketch(img, threshold=250):
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT UNIQUE NOT NULL,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    # Image history table
-    c.execute('''CREATE TABLE IF NOT EXISTS image_history (
-        id SERIAL PRIMARY KEY,
-        image_id TEXT UNIQUE NOT NULL,
-        user_id TEXT NOT NULL,
-        original_filename TEXT,
-        generated_image BYTEA NOT NULL,
-        attributes TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
-    )''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        c = conn.cursor()
+        
+        # Users table
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT UNIQUE NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Image history table
+        c.execute('''CREATE TABLE IF NOT EXISTS image_history (
+            id SERIAL PRIMARY KEY,
+            image_id TEXT UNIQUE NOT NULL,
+            user_id TEXT NOT NULL,
+            original_filename TEXT,
+            generated_image BYTEA NOT NULL,
+            attributes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+        )''')
+        
+        conn.commit()
+        conn.close()
+        print("✓ Database tables initialized successfully")
+    except psycopg2.errors.UniqueViolation as e:
+        print(f"⚠ Database tables already exist: {e}")
+        if conn:
+            conn.rollback()
+            conn.close()
+    except Exception as e:
+        print(f"⚠ Database initialization error: {e}")
+        if conn:
+            conn.rollback()
+            conn.close()
 
 def get_db():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
