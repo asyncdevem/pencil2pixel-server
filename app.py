@@ -8,6 +8,8 @@ import io
 import base64
 import os
 import numpy as np
+import os
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
 import cv2
 from datetime import datetime, timedelta
 from functools import wraps
