@@ -1,8 +1,7 @@
 runtime: python
 startCommand: gunicorn -w 1 -b :8080 app:app --timeout 120 --worker-tmp-dir /tmp
-buildCommand: |
-  apt-get update
-  apt-get install -y libxcb1
-  pip install --no-cache-dir -r requirements.txt
+buildCommand: pip install --no-cache-dir -r requirements.txt
 port: 8080
-memory: 4096mb
+memory: 2048mb
+env:
+  DATABASE_URL: postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require

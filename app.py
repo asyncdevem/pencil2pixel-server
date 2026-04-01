@@ -9,8 +9,6 @@ import base64
 import os
 import numpy as np
 import os
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
-import cv2
 from datetime import datetime, timedelta
 from functools import wraps
 import jwt
@@ -38,7 +36,7 @@ print("✓ Applied GFPGAN compatibility patch for torchvision")
 app = Flask(__name__)
 CORS(app)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb%ssslmode=require')
+app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require')
 
 # Quality enhancement settings
 QUALITY_PRESETS = {
@@ -147,8 +145,12 @@ transform = T.Compose([
 # --- LOAD GFPGAN ENHANCER ---
 gfpgan_available = False
 gfpgan_restorer = None
+cv2 = None
 
 try:
+    # Import cv2 only when loading GFPGAN
+    os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '0'
+    import cv2
     from gfpgan import GFPGANer
     
     # Initialize GFPGAN
@@ -175,7 +177,7 @@ def enhance_output_image(img, quality='medium', use_gfpgan=True):
     Apply post-processing enhancements to improve output quality
     If GFPGAN is available and use_gfpgan=True, use GFPGAN, otherwise use PIL
     """
-    if use_gfpgan and gfpgan_available:
+    if use_gfpgan and gfpgan_available and cv2 is not None:
         # Use GFPGAN enhancement
         try:
             # Convert PIL to numpy array in BGR format for GFPGAN

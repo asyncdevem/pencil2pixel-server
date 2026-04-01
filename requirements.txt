@@ -4,7 +4,7 @@ torch
 torchvision
 pillow
 numpy
-opencv-python
+opencv-python-headless
 PyJWT
 Werkzeug
 gunicorn
