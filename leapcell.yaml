@@ -2,8 +2,7 @@ runtime: python
 startCommand: gunicorn -w 1 -b :8080 app:app --timeout 120 --preload
 buildCommand: |
   apt-get update
-  apt-get install -y libgl1 libglib2.0-0 libxcb1
-  pip uninstall -y opencv-python opencv-contrib-python
+  apt-get install -y libxcb1
   pip install --no-cache-dir -r requirements.txt
 port: 8080
-memory: 2048mb
+memory: 4096mb
