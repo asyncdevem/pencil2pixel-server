@@ -1,12 +1,12 @@
-Flask
-flask-cors
+fastapi
+uvicorn
+python-multipart
+passlib[bcrypt]
+python-jose[cryptography]
 torch
 torchvision
 pillow
 numpy
 opencv-python-headless
-PyJWT
-Werkzeug
-gunicorn
 gfpgan
 psycopg2-binary

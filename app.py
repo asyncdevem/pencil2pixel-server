@@ -1,5 +1,8 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Form, Header
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, List
+from pydantic import BaseModel, EmailStr
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -8,13 +11,11 @@ import io
 import base64
 import os
 import numpy as np
-import os
 from datetime import datetime, timedelta
-from functools import wraps
 import jwt
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from werkzeug.security import generate_password_hash, check_password_hash
+from passlib.hash import bcrypt
 import uuid
 
 # Apply GFPGAN compatibility patch BEFORE importing GFPGAN
@@ -33,10 +34,38 @@ class FunctionalTensorModule:
 sys.modules['torchvision.transforms.functional_tensor'] = FunctionalTensorModule()
 print("✓ Applied GFPGAN compatibility patch for torchvision")
 
-app = Flask(__name__)
-CORS(app)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['DATABASE_URL'] = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require')
+app = FastAPI(title="Pencil2Pixel API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SECRET_KEY = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_YjbBoyQ7gI8M@ep-red-butterfly-amb74pm5-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require')
+
+# Pydantic models
+class SignupRequest(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class ProfileUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
+
+class SaveImageRequest(BaseModel):
+    image: str
+    filename: Optional[str] = "generated_image.png"
+    attributes: Optional[str] = "none"
 
 # Quality enhancement settings
 QUALITY_PRESETS = {
@@ -251,7 +280,7 @@ def create_mask_from_sketch(img, threshold=250):
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = psycopg2.connect(app.config['DATABASE_URL'])
+    conn = psycopg2.connect(DATABASE_URL)
     c = conn.cursor()
     
     # Users table
@@ -281,69 +310,51 @@ def init_db():
     conn.close()
 
 def get_db():
-    conn = psycopg2.connect(app.config['DATABASE_URL'], cursor_factory=RealDictCursor)
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return conn
 
-# Initialize database on startup
-init_db()
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
-# --- AUTHENTICATION MIDDLEWARE ---
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        
-        if not token:
-            return jsonify({'error': 'Token is missing'}), 401
-        
-        try:
-            if token.startswith('Bearer '):
-                token = token[7:]
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user_id = data['user_id']
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Invalid token'}), 401
-        
-        return f(current_user_id, *args, **kwargs)
+# --- AUTHENTICATION DEPENDENCY ---
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail='Token is missing')
     
-    return decorated
+    try:
+        token = authorization.replace('Bearer ', '') if authorization.startswith('Bearer ') else authorization
+        data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        return data['user_id']
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail='Token has expired')
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail='Invalid token')
 
 # --- API ENDPOINTS ---
 
 # --- AUTHENTICATION ENDPOINTS ---
-@app.route('/auth/signup', methods=['POST'])
-def signup():
+@app.post('/auth/signup')
+async def signup(data: SignupRequest):
     try:
-        data = request.get_json()
-        
-        if not data or not data.get('username') or not data.get('email') or not data.get('password'):
-            return jsonify({'error': 'Username, email, and password are required'}), 400
-        
-        username = data['username']
-        email = data['email']
-        password = data['password']
-        
-        # Validate password length
-        if len(password) < 6:
-            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+        if len(data.password) < 6:
+            raise HTTPException(status_code=400, detail='Password must be at least 6 characters')
         
         conn = get_db()
         c = conn.cursor()
         
         # Check if user already exists
-        c.execute('SELECT * FROM users WHERE username = %s OR email = %s', (username, email))
+        c.execute('SELECT * FROM users WHERE username = %s OR email = %s', (data.username, data.email))
         if c.fetchone():
             conn.close()
-            return jsonify({'error': 'Username or email already exists'}), 409
+            raise HTTPException(status_code=409, detail='Username or email already exists')
         
         # Create new user
         user_id = str(uuid.uuid4())
-        password_hash = generate_password_hash(password)
+        password_hash = bcrypt.hash(data.password)
         
         c.execute('INSERT INTO users (user_id, username, email, password_hash) VALUES (%s, %s, %s, %s)',
-                  (user_id, username, email, password_hash))
+                  (user_id, data.username, data.email, password_hash))
         conn.commit()
         conn.close()
         
@@ -351,49 +362,43 @@ def signup():
         token = jwt.encode({
             'user_id': user_id,
             'exp': datetime.utcnow() + timedelta(days=7)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
+        }, SECRET_KEY, algorithm='HS256')
         
-        return jsonify({
+        return {
             'message': 'User created successfully',
             'user': {
                 'user_id': user_id,
-                'username': username,
-                'email': email
+                'username': data.username,
+                'email': data.email
             },
             'token': token
-        }), 201
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/auth/login', methods=['POST'])
-def login():
+@app.post('/auth/login')
+async def login(data: LoginRequest):
     try:
-        data = request.get_json()
-        
-        if not data or not data.get('email') or not data.get('password'):
-            return jsonify({'error': 'Email and password are required'}), 400
-        
-        email = data['email']
-        password = data['password']
-        
         conn = get_db()
         c = conn.cursor()
         
-        c.execute('SELECT * FROM users WHERE email = %s', (email,))
+        c.execute('SELECT * FROM users WHERE email = %s', (data.email,))
         user = c.fetchone()
         conn.close()
         
-        if not user or not check_password_hash(user['password_hash'], password):
-            return jsonify({'error': 'Invalid email or password'}), 401
+        if not user or not bcrypt.verify(data.password, user['password_hash']):
+            raise HTTPException(status_code=401, detail='Invalid email or password')
         
         # Generate token
         token = jwt.encode({
             'user_id': user['user_id'],
             'exp': datetime.utcnow() + timedelta(days=7)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
+        }, SECRET_KEY, algorithm='HS256')
         
-        return jsonify({
+        return {
             'message': 'Login successful',
             'user': {
                 'user_id': user['user_id'],
@@ -401,14 +406,15 @@ def login():
                 'email': user['email']
             },
             'token': token
-        }), 200
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/auth/profile', methods=['GET'])
-@token_required
-def get_profile(current_user_id):
+@app.get('/auth/profile')
+async def get_profile(current_user_id: str = Depends(get_current_user)):
     try:
         conn = get_db()
         c = conn.cursor()
@@ -423,64 +429,60 @@ def get_profile(current_user_id):
         conn.close()
         
         if not user:
-            return jsonify({'error': 'User not found'}), 404
+            raise HTTPException(status_code=404, detail='User not found')
         
-        return jsonify({
+        return {
             'user': {
                 'user_id': user['user_id'],
                 'username': user['username'],
                 'email': user['email'],
-                'created_at': user['created_at'],
+                'created_at': str(user['created_at']),
                 'total_images': image_count
             }
-        }), 200
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/auth/profile', methods=['PUT'])
-@token_required
-def update_profile(current_user_id):
+@app.put('/auth/profile')
+async def update_profile(data: ProfileUpdate, current_user_id: str = Depends(get_current_user)):
     try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
         conn = get_db()
         c = conn.cursor()
         
         updates = []
         params = []
         
-        if 'username' in data:
+        if data.username:
             # Check if username already exists
-            c.execute('SELECT * FROM users WHERE username = %s AND user_id != %s', (data['username'], current_user_id))
+            c.execute('SELECT * FROM users WHERE username = %s AND user_id != %s', (data.username, current_user_id))
             if c.fetchone():
                 conn.close()
-                return jsonify({'error': 'Username already exists'}), 409
+                raise HTTPException(status_code=409, detail='Username already exists')
             updates.append('username = %s')
-            params.append(data['username'])
+            params.append(data.username)
         
-        if 'email' in data:
+        if data.email:
             # Check if email already exists
-            c.execute('SELECT * FROM users WHERE email = %s AND user_id != %s', (data['email'], current_user_id))
+            c.execute('SELECT * FROM users WHERE email = %s AND user_id != %s', (data.email, current_user_id))
             if c.fetchone():
                 conn.close()
-                return jsonify({'error': 'Email already exists'}), 409
+                raise HTTPException(status_code=409, detail='Email already exists')
             updates.append('email = %s')
-            params.append(data['email'])
+            params.append(data.email)
         
-        if 'password' in data:
-            if len(data['password']) < 6:
+        if data.password:
+            if len(data.password) < 6:
                 conn.close()
-                return jsonify({'error': 'Password must be at least 6 characters'}), 400
+                raise HTTPException(status_code=400, detail='Password must be at least 6 characters')
             updates.append('password_hash = %s')
-            params.append(generate_password_hash(data['password']))
+            params.append(bcrypt.hash(data.password))
         
         if not updates:
             conn.close()
-            return jsonify({'error': 'No valid fields to update'}), 400
+            raise HTTPException(status_code=400, detail='No valid fields to update')
         
         updates.append('updated_at = CURRENT_TIMESTAMP')
         params.append(current_user_id)
@@ -493,26 +495,25 @@ def update_profile(current_user_id):
         user = c.fetchone()
         conn.close()
         
-        return jsonify({
+        return {
             'message': 'Profile updated successfully',
             'user': {
                 'user_id': user['user_id'],
                 'username': user['username'],
                 'email': user['email'],
-                'updated_at': user['updated_at']
+                'updated_at': str(user['updated_at'])
             }
-        }), 200
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- IMAGE HISTORY ENDPOINTS ---
-@app.route('/history', methods=['GET'])
-@token_required
-def get_history(current_user_id):
+@app.get('/history')
+async def get_history(page: int = 1, limit: int = 10, current_user_id: str = Depends(get_current_user)):
     try:
-        page = request.args.get('page', 1, type=int)
-        limit = request.args.get('limit', 10, type=int)
         offset = (page - 1) * limit
         
         conn = get_db()
@@ -530,12 +531,12 @@ def get_history(current_user_id):
         
         conn.close()
         
-        return jsonify({
+        return {
             'images': [{
                 'image_id': img['image_id'],
                 'original_filename': img['original_filename'],
                 'attributes': img['attributes'],
-                'created_at': img['created_at']
+                'created_at': str(img['created_at'])
             } for img in images],
             'pagination': {
                 'page': page,
@@ -543,14 +544,13 @@ def get_history(current_user_id):
                 'total': total,
                 'pages': (total + limit - 1) // limit
             }
-        }), 200
+        }
     
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/history/<image_id>', methods=['GET'])
-@token_required
-def get_history_image(current_user_id, image_id):
+@app.get('/history/{image_id}')
+async def get_history_image(image_id: str, current_user_id: str = Depends(get_current_user)):
     try:
         conn = get_db()
         c = conn.cursor()
@@ -560,21 +560,21 @@ def get_history_image(current_user_id, image_id):
         conn.close()
         
         if not image:
-            return jsonify({'error': 'Image not found'}), 404
+            raise HTTPException(status_code=404, detail='Image not found')
         
-        return send_file(
+        return StreamingResponse(
             io.BytesIO(image['generated_image']),
-            mimetype='image/png',
-            as_attachment=True,
-            download_name=f"{image['original_filename'] or 'generated'}.png"
+            media_type='image/png',
+            headers={'Content-Disposition': f'attachment; filename="{image["original_filename"] or "generated"}.png"'}
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/history/<image_id>', methods=['DELETE'])
-@token_required
-def delete_history_image(current_user_id, image_id):
+@app.delete('/history/{image_id}')
+async def delete_history_image(image_id: str, current_user_id: str = Depends(get_current_user)):
     try:
         conn = get_db()
         c = conn.cursor()
@@ -583,19 +583,20 @@ def delete_history_image(current_user_id, image_id):
         
         if c.rowcount == 0:
             conn.close()
-            return jsonify({'error': 'Image not found'}), 404
+            raise HTTPException(status_code=404, detail='Image not found')
         
         conn.commit()
         conn.close()
         
-        return jsonify({'message': 'Image deleted successfully'}), 200
+        return {'message': 'Image deleted successfully'}
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/history', methods=['DELETE'])
-@token_required
-def clear_history(current_user_id):
+@app.delete('/history')
+async def clear_history(current_user_id: str = Depends(get_current_user)):
     try:
         conn = get_db()
         c = conn.cursor()
@@ -606,27 +607,27 @@ def clear_history(current_user_id):
         conn.commit()
         conn.close()
         
-        return jsonify({
+        return {
             'message': 'History cleared successfully',
             'deleted_count': deleted_count
-        }), 200
+        }
     
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
+@app.get('/health')
+async def health():
+    return {
         'status': 'ok',
         'service': 'pencil2pixel-api',
         'device': device,
         'gfpgan_available': gfpgan_available,
         'model_loaded': os.path.exists('model/pencil2pixel.pth')
-    }), 200
+    }
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({
+@app.get('/')
+async def index():
+    return {
         'message': 'Pencil2Pixel API is running',
         'status': 'ok',
         'endpoints': {
@@ -642,51 +643,39 @@ def index():
             },
             'history': '/history'
         }
-    }), 200
+    }
 
-@app.route('/generate', methods=['POST'])
-@token_required
-def generate(current_user_id):
+@app.post('/generate')
+async def generate(
+    image: UploadFile = File(...),
+    quality: str = Form('medium'),
+    enhancement: str = Form('gfpgan'),
+    attributes: Optional[str] = Form(None),
+    upscale: bool = Form(False),
+    save: bool = Form(False),
+    format: str = Form('image'),
+    current_user_id: str = Depends(get_current_user)
+):
     try:
-        # Check if image file is present
-        if 'image' not in request.files:
-            return jsonify({'error': 'No image file provided'}), 400
-        
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
-        
-        # Get quality setting
-        quality = request.form.get('quality', 'medium')
         if quality not in QUALITY_PRESETS:
             quality = 'medium'
         
-        # Get enhancement method (gfpgan or pil)
-        enhancement = request.form.get('enhancement', 'gfpgan')  # 'gfpgan' or 'pil'
         use_gfpgan = enhancement == 'gfpgan' and gfpgan_available
         
-        # Get attributes (optional - can be None)
-        attributes = request.form.get('attributes', None)
+        # Get attributes
         if attributes and attr_dim > 0:
             attr_list = [float(x) for x in attributes.split(',')]
             if len(attr_list) != attr_dim:
-                return jsonify({'error': f'Attributes must be {attr_dim} values'}), 400
+                raise HTTPException(status_code=400, detail=f'Attributes must be {attr_dim} values')
             attr_tensor = torch.tensor([attr_list], dtype=torch.float32).to(device)
         else:
-            # No attributes or model doesn't use them - use zeros
             attr_tensor = torch.zeros(1, max(attr_dim, 1), dtype=torch.float32).to(device)
         
-        # Process image with preprocessing
-        img = Image.open(file.stream).convert('RGB')
-        original_size = img.size
-        
-        # Preprocess input
+        # Process image
+        img = Image.open(io.BytesIO(await image.read())).convert('RGB')
         img = preprocess_input_image(img)
         
-        # Create sketch tensor
         sketch_tensor = transform(img).unsqueeze(0).to(device)
-        
-        # Create mask tensor (auto-masking)
         mask_np = create_mask_from_sketch(img)
         mask_tensor = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(device)
         
@@ -694,49 +683,33 @@ def generate(current_user_id):
         with torch.no_grad():
             output = model(sketch_tensor, mask_tensor, attr_tensor)
         
-        # Denormalize and convert to PIL
         output = (output.squeeze().cpu() + 1) / 2
         output_img = T.ToPILImage()(output)
-        
-        # Apply post-processing enhancements
         output_img = enhance_output_image(output_img, quality, use_gfpgan=use_gfpgan)
         
-        # Optionally resize to larger size for better quality
-        upscale = request.form.get('upscale', 'false').lower() == 'true'
         if upscale:
-            # Upscale to 2x using high-quality resampling
-            new_size = (1024, 1024)
-            output_img = output_img.resize(new_size, Image.Resampling.LANCZOS)
+            output_img = output_img.resize((1024, 1024), Image.Resampling.LANCZOS)
         
-        # Save to history if requested
-        save_to_history = request.form.get('save', 'false').lower() == 'true'
+        # Save to history
         image_id = None
-        
-        if save_to_history:
+        if save:
             img_io = io.BytesIO()
             output_img.save(img_io, 'PNG')
             img_bytes = img_io.getvalue()
             
             image_id = str(uuid.uuid4())
-            # Save attributes if provided, otherwise save "none"
-            if attributes:
-                attr_str = attributes
-            else:
-                attr_str = "none"
+            attr_str = attributes if attributes else "none"
             
             conn = get_db()
             c = conn.cursor()
             c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
                          VALUES (%s, %s, %s, %s, %s)''',
-                      (image_id, current_user_id, file.filename, img_bytes, attr_str))
+                      (image_id, current_user_id, image.filename, img_bytes, attr_str))
             conn.commit()
             conn.close()
         
         # Return format
-        return_format = request.form.get('format', 'image')  # 'image' or 'base64'
-        
-        if return_format == 'base64':
-            # Return as base64 JSON
+        if format == 'base64':
             buffered = io.BytesIO()
             output_img.save(buffered, format="PNG")
             img_str = base64.b64encode(buffered.getvalue()).decode()
@@ -751,62 +724,53 @@ def generate(current_user_id):
             if image_id:
                 response['image_id'] = image_id
                 response['saved'] = True
-            return jsonify(response)
+            return response
         else:
-            # Return as image file
             img_io = io.BytesIO()
             output_img.save(img_io, 'PNG')
             img_io.seek(0)
-            return send_file(img_io, mimetype='image/png')
+            return StreamingResponse(img_io, media_type='image/png')
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/generate-batch', methods=['POST'])
-@token_required
-def generate_batch(current_user_id):
+@app.post('/generate-batch')
+async def generate_batch(
+    images: List[UploadFile] = File(...),
+    attributes: Optional[str] = Form(None),
+    quality: str = Form('medium'),
+    upscale: bool = Form(False),
+    enhancement: str = Form('gfpgan'),
+    save: bool = Form(False),
+    current_user_id: str = Depends(get_current_user)
+):
     try:
-        if 'images' not in request.files:
-            return jsonify({'error': 'No images provided'}), 400
-        
-        files = request.files.getlist('images')
-        attributes = request.form.get('attributes', None)
-        quality = request.form.get('quality', 'medium')
-        upscale = request.form.get('upscale', 'false').lower() == 'true'
-        
-        # Get enhancement method
-        enhancement = request.form.get('enhancement', 'gfpgan')
-        use_gfpgan = enhancement == 'gfpgan' and gfpgan_available
-        
         if quality not in QUALITY_PRESETS:
             quality = 'medium'
+        
+        use_gfpgan = enhancement == 'gfpgan' and gfpgan_available
         
         if attributes and attr_dim > 0:
             attr_list = [float(x) for x in attributes.split(',')]
             if len(attr_list) != attr_dim:
-                return jsonify({'error': f'Attributes must be {attr_dim} values'}), 400
+                raise HTTPException(status_code=400, detail=f'Attributes must be {attr_dim} values')
             attr_tensor = torch.tensor([attr_list], dtype=torch.float32).to(device)
         else:
-            # No attributes or model doesn't use them - use zeros
             attr_tensor = torch.zeros(1, max(attr_dim, 1), dtype=torch.float32).to(device)
         
         results = []
         attr_str = ','.join(map(str, attr_list if attributes else [0.0, 0.0, 0.0, 0.0]))
         
-        save_to_history = request.form.get('save', 'false').lower() == 'true'
-        
-        conn = get_db() if save_to_history else None
+        conn = get_db() if save else None
         c = conn.cursor() if conn else None
         
-        for file in files:
-            img = Image.open(file.stream).convert('RGB')
-            
-            # Preprocess input
+        for file in images:
+            img = Image.open(io.BytesIO(await file.read())).convert('RGB')
             img = preprocess_input_image(img)
             
             sketch_tensor = transform(img).unsqueeze(0).to(device)
-            
-            # Create mask
             mask_np = create_mask_from_sketch(img)
             mask_tensor = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(device)
             
@@ -815,14 +779,10 @@ def generate_batch(current_user_id):
             
             output = (output.squeeze().cpu() + 1) / 2
             output_img = T.ToPILImage()(output)
-            
-            # Apply post-processing enhancements
             output_img = enhance_output_image(output_img, quality, use_gfpgan=use_gfpgan)
             
-            # Optionally upscale
             if upscale:
-                new_size = (1024, 1024)
-                output_img = output_img.resize(new_size, Image.Resampling.LANCZOS)
+                output_img = output_img.resize((1024, 1024), Image.Resampling.LANCZOS)
             
             buffered = io.BytesIO()
             output_img.save(buffered, format="PNG")
@@ -837,7 +797,7 @@ def generate_batch(current_user_id):
                 'size': output_img.size
             }
             
-            if save_to_history:
+            if save:
                 image_id = str(uuid.uuid4())
                 c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
                              VALUES (%s, %s, %s, %s, %s)''',
@@ -851,34 +811,25 @@ def generate_batch(current_user_id):
             conn.commit()
             conn.close()
         
-        return jsonify({'results': results, 'count': len(results)})
+        return {'results': results, 'count': len(results)}
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/history/save', methods=['POST'])
-@token_required
-def save_to_history(current_user_id):
+@app.post('/history/save')
+async def save_to_history(data: SaveImageRequest, current_user_id: str = Depends(get_current_user)):
     """
     Save an already-generated image to history without regenerating.
     Expects base64 encoded image in request body.
     """
     try:
-        data = request.get_json()
-        
-        if not data or 'image' not in data:
-            return jsonify({'error': 'No image data provided'}), 400
-        
-        # Get image data and metadata
-        image_base64 = data['image']
-        original_filename = data.get('filename', 'generated_image.png')
-        attributes = data.get('attributes', 'none')
-        
         # Decode base64 image
         try:
-            image_bytes = base64.b64decode(image_base64)
+            image_bytes = base64.b64decode(data.image)
         except Exception as e:
-            return jsonify({'error': f'Invalid base64 image data: {str(e)}'}), 400
+            raise HTTPException(status_code=400, detail=f'Invalid base64 image data: {str(e)}')
         
         # Generate unique image ID
         image_id = str(uuid.uuid4())
@@ -888,19 +839,17 @@ def save_to_history(current_user_id):
         c = conn.cursor()
         c.execute('''INSERT INTO image_history (image_id, user_id, original_filename, generated_image, attributes)
                      VALUES (%s, %s, %s, %s, %s)''',
-                  (image_id, current_user_id, original_filename, image_bytes, attributes))
+                  (image_id, current_user_id, data.filename, image_bytes, data.attributes))
         conn.commit()
         conn.close()
         
-        return jsonify({
+        return {
             'message': 'Image saved to history successfully',
             'image_id': image_id,
             'saved': True
-        }), 201
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False)
+        raise HTTPException(status_code=500, detail=str(e))
